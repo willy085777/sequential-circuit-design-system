@@ -54,6 +54,7 @@ function componentRect(component) {
 }
 
 function protectedRectFor(component) {
+  if (component.type === "CONST") return inflateRect(visibleComponentRect(component), 2);
   const margin = component.kind === "flipFlop"
     ? 18
     : component.type === "OR"
@@ -64,6 +65,32 @@ function protectedRectFor(component) {
         ? 12
         : 8;
   return inflateRect(componentRect(component), margin);
+}
+
+function constantVisibleRect(component) {
+  const pin = component.pins?.out || { x: component.x + component.width, y: component.y + component.height / 2 };
+  return {
+    x: pin.x - 38,
+    y: pin.y - 16,
+    width: 37,
+    height: 22
+  };
+}
+
+function orVisibleRect(component) {
+  const rect = componentRect(component);
+  return {
+    x: rect.x + rect.width * 0.02,
+    y: rect.y,
+    width: rect.width * 0.98,
+    height: rect.height
+  };
+}
+
+function visibleComponentRect(component) {
+  if (component.type === "CONST") return constantVisibleRect(component);
+  if (component.type === "OR") return orVisibleRect(component);
+  return componentRect(component);
 }
 
 function labelRect(label) {
@@ -434,6 +461,7 @@ function validateWireComponentCollisions(layout, errors) {
   (layout.wires || []).forEach((wire) => {
     wireSegments(wire).forEach((segment) => {
       components.forEach((component) => {
+        if (component.type === "CONST" && (wire.sourceComponentId === component.id || wire.source === `${component.id}.out`)) return;
         const rect = protectedRectFor(component);
         if (!segmentIntersectsProtectedComponent(segment, component, rect)) return;
         if (segmentTouchesComponentPin(segment, component)) return;
@@ -458,13 +486,15 @@ function validateComponentOverlap(layout, errors) {
     for (let rightIndex = leftIndex + 1; rightIndex < components.length; rightIndex += 1) {
       const left = components[leftIndex];
       const right = components[rightIndex];
-      if (!rectsOverlap(protectedRectFor(left), protectedRectFor(right))) continue;
+      if (!rectsOverlap(visibleComponentRect(left), visibleComponentRect(right))) continue;
       const type = componentCollisionType(left, right);
       pushIssue(errors, type, `Component ${left.id} overlaps ${right.id}`, {
         componentA: left.id,
         componentB: right.id,
         componentTypeA: left.type,
-        componentTypeB: right.type
+        componentTypeB: right.type,
+        componentBoxA: visibleComponentRect(left),
+        componentBoxB: visibleComponentRect(right)
       });
     }
   }
@@ -476,7 +506,7 @@ function validateBranchSpacing(layout, errors) {
     const groups = bus.signalClass === "feedback"
       ? [
           { taps: (bus.tapPoints || []).filter((tap) => tap.section === "return"), axis: "y" },
-          { taps: (bus.tapPoints || []).filter((tap) => tap.section === "upper"), axis: "x" }
+          { taps: (bus.tapPoints || []).filter((tap) => tap.section === "upper"), axis: "y" }
         ]
       : [{ taps: bus.tapPoints || [], axis: bus.orientation === "vertical" ? "y" : "x" }];
     groups.forEach(({ taps, axis }) => {
@@ -747,6 +777,30 @@ function validateReferenceStyle(layout, errors, warnings) {
         pullbackCount
       });
     }
+    const orTrunkWires = (layout.wires || []).filter((wire) => wire.routingRole === "feedback-or-trunk" && wire.signal === bus.signal);
+    if (orTrunkWires.length > 1) {
+      pushIssue(errors, "DUPLICATE_FEEDBACK_OR_TRUNK", `${bus.signal} has ${orTrunkWires.length} OR-stage pull-down trunks; OR gates must share one Q trunk`, {
+        signal: bus.signal,
+        count: orTrunkWires.length
+      });
+    }
+    if (upperTaps.length) {
+      const uniqueUpperXs = [...new Set(upperTaps.map((tap) => Math.round(tap.x)))];
+      if (uniqueUpperXs.length > 1) {
+        pushIssue(errors, "DUPLICATE_FEEDBACK_OR_TRUNK", `${bus.signal} OR-stage branches use multiple x trunks (${uniqueUpperXs.join(", ")})`, {
+          signal: bus.signal,
+          xPositions: uniqueUpperXs
+        });
+      }
+      const lowestUpperTapY = Math.max(...upperTaps.map((tap) => tap.y));
+      if (lowestUpperTapY > bus.topY && orTrunkWires.length !== 1) {
+        pushIssue(errors, "MISSING_FEEDBACK_OR_TRUNK", `${bus.signal} OR-stage branches need exactly one shared vertical pull-down trunk`, {
+          signal: bus.signal,
+          expectedTrunks: 1,
+          actualTrunks: orTrunkWires.length
+        });
+      }
+    }
     if (pullbackWire && upperTaps.length && !returnTaps.length) {
       const finalPoint = (pullbackWire.points || [])[pullbackWire.points.length - 1];
       const expectedX = Math.min(...upperTaps.map((tap) => tap.x));
@@ -772,6 +826,23 @@ function validateReferenceStyle(layout, errors, warnings) {
       }
     }
   });
+  const usedOrTrunkBuses = feedbackBuses
+    .filter((bus) => (bus.upperTapPoints || []).length)
+    .sort((left, right) => (left.orderIndex ?? 0) - (right.orderIndex ?? 0));
+  for (let index = 0; index < usedOrTrunkBuses.length - 1; index += 1) {
+    const current = usedOrTrunkBuses[index];
+    const next = usedOrTrunkBuses[index + 1];
+    const currentX = current.upperTapPoints?.[0]?.x;
+    const nextX = next.upperTapPoints?.[0]?.x;
+    if (Number.isFinite(currentX) && Number.isFinite(nextX) && currentX >= nextX) {
+      pushIssue(errors, "FEEDBACK_OR_TRUNK_ORDER_ERROR", "OR-stage Q pull-down trunks must be ordered left-to-right as Q0, Q0', Q1, Q1'", {
+        current: current.signal,
+        next: next.signal,
+        currentX,
+        nextX
+      });
+    }
+  }
   for (let index = 0; index < feedbackBuses.length - 1; index += 1) {
     const current = feedbackBuses[index];
     const next = feedbackBuses[index + 1];
@@ -923,10 +994,12 @@ function validateReferenceStyle(layout, errors, warnings) {
     }
     if (tap.renderDot !== false && bus?.signalClass === "feedback") {
       if (tap.section === "upper") {
-        const minX = Math.min(bus.riseX ?? tap.x, bus.start?.x ?? tap.x);
-        const maxX = Math.max(bus.riseX ?? tap.x, bus.start?.x ?? tap.x);
-        if (tap.x <= minX || tap.x >= maxX) {
-          pushIssue(errors, "UNUSED_JUNCTION_DOT", `${tap.id} is on a feedback upper endpoint; final bends must not render junction dots`, {
+        const sameTrunkTaps = (bus.upperTapPoints || [])
+          .filter((item) => Math.round(item.x) === Math.round(tap.x))
+          .sort((left, right) => left.y - right.y);
+        const lowestTapY = sameTrunkTaps.length ? Math.max(...sameTrunkTaps.map((item) => item.y)) : tap.y;
+        if (sameTrunkTaps.length <= 1 || tap.y >= lowestTapY) {
+          pushIssue(errors, "UNUSED_JUNCTION_DOT", `${tap.id} is on a feedback OR trunk final bend; final turns must not render junction dots`, {
             tap: tap.id,
             bus: bus.id
           });

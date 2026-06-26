@@ -134,7 +134,7 @@ function colorClassForSignal(signalClass) {
 
 function gateSize(type, visualInputCount = 2) {
   if (type === "NOT") return { width: 68, height: 50 };
-  if (type === "CONST") return { width: 68, height: 50 };
+  if (type === "CONST") return { width: 40, height: 34 };
   if (type === "WIRE") return { width: 54, height: 28 };
   return {
     width: type === "OR" ? 92 : 86,
@@ -417,31 +417,63 @@ function addFeedbackTap(layout, bus, point, assignedWireId, section) {
   return tap;
 }
 
+function feedbackOrTrunkX(layout, bus, targetPin) {
+  if (Number.isFinite(bus.orTrunkX)) return bus.orTrunkX;
+  const gateWidth = gateSize("AND").width;
+  const baseX = layout.config.andStageX + gateWidth + 24;
+  const orderedX = baseX + (bus.orderIndex || 0) * Math.max(14, Math.round(layout.config.branchLaneSpacing * 0.7));
+  const minX = layout.config.andStageX + gateWidth + 18;
+  const maxX = targetPin.x - 22;
+  bus.orTrunkX = clamp(orderedX, minX, maxX);
+  return bus.orTrunkX;
+}
+
 function addFeedbackToPinWire(layout, signal, targetComponent, pinName, metadata = {}) {
   const bus = layout.busBySignal.get(signal);
   const targetPin = targetComponent.pins[pinName];
   if (!bus || !targetPin) return null;
   const wireId = metadata.id || `wire-${sanitizeId(signal)}-to-${targetComponent.id}-${pinName}`;
   const section = targetComponent.type === "OR" ? "upper" : "return";
-  const tap = section === "upper"
-    ? addFeedbackTap(
-        layout,
-        bus,
-        {
-          x: clamp(
-            targetPin.x - 34 - bus.orderIndex * 18 - bus.upperTapPoints.length * Math.max(10, Math.round(layout.config.branchLaneSpacing * 0.5)),
-            bus.returnX + layout.config.tapPointSpacing,
-            bus.riseX - layout.config.tapPointSpacing
-          ),
-          y: bus.topY
-        },
-        wireId,
-        section
-      )
-    : addFeedbackTap(layout, bus, { x: bus.returnX, y: targetPin.y }, wireId, section);
-  const points = section === "upper"
-    ? [tap, { x: tap.x, y: targetPin.y }, targetPin]
-    : [tap, targetPin];
+  let tap;
+  let points;
+  let routeMetadata = {};
+  if (section === "upper") {
+    tap = addFeedbackTap(layout, bus, { x: feedbackOrTrunkX(layout, bus, targetPin), y: targetPin.y }, wireId, section);
+    points = [tap, targetPin];
+  } else if (targetComponent.kind === "flipFlop") {
+    const initialTapPoint = { x: bus.returnX, y: targetPin.y };
+    const standardRoute = standardFlipFlopInputRoute(initialTapPoint, targetPin, targetComponent);
+    const gapRoute = routeNeedsFallback(layout, signal, standardRoute.points, targetComponent)
+      ? chooseAndGapRoute(layout, signal, initialTapPoint, targetPin, targetComponent, standardRoute.approachX)
+      : null;
+    const preferredTapY = gapRoute?.y ?? standardRoute.safeY;
+    tap = addFeedbackTap(layout, bus, { x: bus.returnX, y: preferredTapY }, wireId, section);
+    points = gapRoute
+      ? routeThroughGapPoints(tap, targetPin, standardRoute.approachX, gapRoute.y)
+      : standardFlipFlopInputRoute(tap, targetPin, targetComponent).points;
+    routeMetadata = {
+      routingFallback: gapRoute ? "and-gap-corridor" : undefined,
+      fallbackGapY: gapRoute?.y,
+      fallbackGapBetween: gapRoute ? [gapRoute.upper, gapRoute.lower] : undefined
+    };
+  } else {
+    const initialTapPoint = { x: bus.returnX, y: targetPin.y };
+    const approachX = Math.max(initialTapPoint.x + layout.config.branchLaneSpacing, targetPin.x - 18);
+    const directPoints = [initialTapPoint, targetPin];
+    const gapRoute = routeNeedsFallback(layout, signal, directPoints, targetComponent)
+      ? chooseAndGapRoute(layout, signal, initialTapPoint, targetPin, targetComponent, approachX)
+      : null;
+    const preferredTapY = gapRoute?.y ?? targetPin.y;
+    tap = addFeedbackTap(layout, bus, { x: bus.returnX, y: preferredTapY }, wireId, section);
+    points = gapRoute
+      ? routeThroughGapPoints(tap, targetPin, approachX, gapRoute.y)
+      : [tap, targetPin];
+    routeMetadata = {
+      routingFallback: gapRoute ? "and-gap-corridor" : undefined,
+      fallbackGapY: gapRoute?.y,
+      fallbackGapBetween: gapRoute ? [gapRoute.upper, gapRoute.lower] : undefined
+    };
+  }
   return addWire(layout, {
     id: wireId,
     signal,
@@ -457,6 +489,9 @@ function addFeedbackToPinWire(layout, signal, targetComponent, pinName, metadata
     targetPinName: pinName,
     comesFromBusTap: true,
     feedbackSection: section,
+    routingFallback: routeMetadata.routingFallback,
+    fallbackGapY: routeMetadata.fallbackGapY,
+    fallbackGapBetween: routeMetadata.fallbackGapBetween,
     preferredRouteDirection: section === "upper" ? "vertical-drop" : "horizontal-branch"
   });
 }
@@ -499,6 +534,162 @@ function targetReference(component, pinName) {
   return `${component.id}.${pinName}`;
 }
 
+function rectRight(rect) {
+  return rect.right ?? rect.x + rect.width;
+}
+
+function rectBottom(rect) {
+  return rect.bottom ?? rect.y + rect.height;
+}
+
+function segmentBounds(points) {
+  const [from, to] = points;
+  return {
+    x1: Math.min(from.x, to.x),
+    x2: Math.max(from.x, to.x),
+    y1: Math.min(from.y, to.y),
+    y2: Math.max(from.y, to.y),
+    horizontal: Math.round(from.y) === Math.round(to.y),
+    vertical: Math.round(from.x) === Math.round(to.x)
+  };
+}
+
+function pathSegments(points = []) {
+  const segments = [];
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const from = points[index];
+    const to = points[index + 1];
+    if (from.x !== to.x || from.y !== to.y) segments.push([from, to]);
+  }
+  return segments;
+}
+
+function segmentIntersectsBox(segment, box) {
+  const bounds = segmentBounds(segment);
+  if (bounds.horizontal) {
+    return bounds.y1 >= box.y && bounds.y1 <= rectBottom(box) && bounds.x2 >= box.x && bounds.x1 <= rectRight(box);
+  }
+  if (bounds.vertical) {
+    return bounds.x1 >= box.x && bounds.x1 <= rectRight(box) && bounds.y2 >= box.y && bounds.y1 <= rectBottom(box);
+  }
+  return true;
+}
+
+function rangesOverlap(leftStart, leftEnd, rightStart, rightEnd) {
+  return Math.min(leftEnd, rightEnd) - Math.max(leftStart, rightStart) > 0;
+}
+
+function collinearSegmentOverlap(leftSegment, rightSegment) {
+  const left = segmentBounds(leftSegment);
+  const right = segmentBounds(rightSegment);
+  if (left.horizontal && right.horizontal && Math.round(left.y1) === Math.round(right.y1)) {
+    return rangesOverlap(left.x1, left.x2, right.x1, right.x2);
+  }
+  if (left.vertical && right.vertical && Math.round(left.x1) === Math.round(right.x1)) {
+    return rangesOverlap(left.y1, left.y2, right.y1, right.y2);
+  }
+  return false;
+}
+
+function routeHitsProtectedComponent(layout, points, excludeComponentIds = new Set()) {
+  return pathSegments(points).some((segment) =>
+    (layout.components || []).some((component) => {
+      if (excludeComponentIds.has(component.id) || !component.protectedBox) return false;
+      if (component.kind !== "gate" && component.kind !== "flipFlop") return false;
+      return segmentIntersectsBox(segment, component.protectedBox);
+    })
+  );
+}
+
+function routeOverlapsExistingWire(layout, signal, points) {
+  const segments = pathSegments(points);
+  return segments.some((segment) =>
+    (layout.wires || []).some((wire) => {
+      if (wire.signal === signal || wire.netId === signal) return false;
+      return pathSegments(wire.points || []).some((existing) => collinearSegmentOverlap(segment, existing));
+    })
+  );
+}
+
+function routeNeedsFallback(layout, signal, points, targetComponent) {
+  const excluded = new Set([targetComponent?.id].filter(Boolean));
+  return routeHitsProtectedComponent(layout, points, excluded) || routeOverlapsExistingWire(layout, signal, points);
+}
+
+function fallbackSignalCanUseAndGap(signal) {
+  return signal === "X" || signal === "X'" || /^Q\d+'?$/.test(String(signal || ""));
+}
+
+function routeThroughGapPoints(sourcePoint, targetPin, approachX, gapY) {
+  return compactPoints([
+    sourcePoint,
+    { x: sourcePoint.x, y: gapY },
+    { x: approachX, y: gapY },
+    { x: approachX, y: targetPin.y },
+    targetPin
+  ]);
+}
+
+function standardFlipFlopInputRoute(sourcePoint, targetPin, targetComponent) {
+  const approachX = targetPin.x - 54;
+  const targetCenter = centerY(targetComponent);
+  const safeY = targetPin.y >= targetCenter ? targetPin.y + 70 : targetPin.y - 70;
+  return {
+    approachX,
+    safeY,
+    points: compactPoints([
+      sourcePoint,
+      { x: sourcePoint.x, y: safeY },
+      { x: approachX, y: safeY },
+      { x: approachX, y: targetPin.y },
+      targetPin
+    ])
+  };
+}
+
+function gapRightSideBlocked(layout, gapY, leftX, rightX) {
+  return (layout.gates || []).some((gate) => {
+    if (gate.type !== "OR") return false;
+    const box = gate.protectedBox || gate.bbox;
+    const overlapsY = gapY >= box.y && gapY <= rectBottom(box);
+    const overlapsX = rectRight(box) >= leftX && box.x <= rightX;
+    return overlapsY && overlapsX;
+  });
+}
+
+function openAndGapCandidates(layout, targetPin, approachX) {
+  const andGates = (layout.gates || [])
+    .filter((gate) => gate.type === "AND")
+    .sort((left, right) => centerY(left) - centerY(right));
+  const candidates = [];
+  for (let index = 0; index < andGates.length - 1; index += 1) {
+    const upper = andGates[index];
+    const lower = andGates[index + 1];
+    const upperBox = upper.protectedBox || upper.bbox;
+    const lowerBox = lower.protectedBox || lower.bbox;
+    const top = rectBottom(upperBox);
+    const bottom = lowerBox.y;
+    const available = bottom - top;
+    if (available < Math.max(24, layout.config.branchLaneSpacing)) continue;
+    const y = Math.round((top + bottom) / 2);
+    const rightOpenX = Math.max(rectRight(upperBox), rectRight(lowerBox));
+    if (gapRightSideBlocked(layout, y, rightOpenX, approachX)) continue;
+    candidates.push({ y, top, bottom, upper: upper.id, lower: lower.id });
+  }
+  return candidates.sort((left, right) => Math.abs(left.y - targetPin.y) - Math.abs(right.y - targetPin.y));
+}
+
+function chooseAndGapRoute(layout, signal, sourcePoint, targetPin, targetComponent, approachX) {
+  if (!fallbackSignalCanUseAndGap(signal)) return null;
+  const candidates = openAndGapCandidates(layout, targetPin, approachX);
+  return candidates
+    .map((candidate) => ({
+      ...candidate,
+      points: routeThroughGapPoints(sourcePoint, targetPin, approachX, candidate.y)
+    }))
+    .find((candidate) => !routeHitsProtectedComponent(layout, candidate.points, new Set([targetComponent.id])));
+}
+
 function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}) {
   const bus = layout.busBySignal.get(signal);
   const targetPin = targetComponent.pins[pinName];
@@ -507,25 +698,65 @@ function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}
     return addFeedbackToPinWire(layout, signal, targetComponent, pinName, metadata);
   }
   const wireId = metadata.id || `wire-${sanitizeId(signal)}-to-${targetComponent.id}-${pinName}`;
-  const tap = allocateTap(layout, bus, nextTapCoordinate(layout, bus, targetPin, metadata.routingRole || "input", targetComponent), wireId);
   let points;
+  let sourceTap;
   if (targetComponent.kind === "flipFlop") {
-    const approachX = targetPin.x - 54;
-    const targetCenter = centerY(targetComponent);
-    const safeY = targetPin.y >= targetCenter ? targetPin.y + 70 : targetPin.y - 70;
-    points = [
-      tap,
-      { x: tap.x, y: safeY },
-      { x: approachX, y: safeY },
-      { x: approachX, y: targetPin.y },
-      targetPin
-    ];
+    const initialTapPoint = { x: bus.x ?? bus.start?.x ?? targetPin.x, y: targetPin.y };
+    const standardRoute = standardFlipFlopInputRoute(initialTapPoint, targetPin, targetComponent);
+    const gapRoute = routeNeedsFallback(layout, signal, standardRoute.points, targetComponent)
+      ? chooseAndGapRoute(layout, signal, initialTapPoint, targetPin, targetComponent, standardRoute.approachX)
+      : null;
+    const preferredTapY = gapRoute?.y ?? standardRoute.safeY;
+    const tap = allocateTap(layout, bus, preferredTapY, wireId, gapRoute ? { minSpacing: 0, minY: preferredTapY, maxY: preferredTapY } : {});
+    sourceTap = tap;
+    points = gapRoute
+      ? routeThroughGapPoints(tap, targetPin, standardRoute.approachX, gapRoute.y)
+      : standardFlipFlopInputRoute(tap, targetPin, targetComponent).points;
+    metadata = {
+      ...metadata,
+      routingFallback: gapRoute ? "and-gap-corridor" : undefined,
+      fallbackGapY: gapRoute?.y,
+      fallbackGapBetween: gapRoute ? [gapRoute.upper, gapRoute.lower] : undefined
+    };
   } else if (bus.orientation === "vertical") {
-    const laneX = Math.round((tap.x + targetPin.x) / 2);
-    points = tap.y === targetPin.y
-      ? [tap, targetPin]
-      : [tap, { x: laneX, y: tap.y }, { x: laneX, y: targetPin.y }, targetPin];
+    const preferredCoordinate = nextTapCoordinate(layout, bus, targetPin, metadata.routingRole || "input", targetComponent);
+    const initialTapPoint = { x: bus.x, y: preferredCoordinate };
+    const initialLaneX = Math.round((initialTapPoint.x + targetPin.x) / 2);
+    const directPoints = initialTapPoint.y === targetPin.y
+      ? [initialTapPoint, targetPin]
+      : [initialTapPoint, { x: initialLaneX, y: initialTapPoint.y }, { x: initialLaneX, y: targetPin.y }, targetPin];
+    const approachX = targetComponent.kind === "flipFlop"
+      ? targetPin.x - 54
+      : Math.max(initialTapPoint.x + layout.config.branchLaneSpacing, targetPin.x - 18);
+    const gapRoute = targetComponent.type !== "NOT" && routeNeedsFallback(layout, signal, directPoints, targetComponent)
+      ? chooseAndGapRoute(layout, signal, initialTapPoint, targetPin, targetComponent, approachX)
+      : null;
+    const preferredTapY = gapRoute?.y ?? preferredCoordinate;
+    const tap = allocateTap(
+      layout,
+      bus,
+      preferredTapY,
+      wireId,
+      gapRoute ? { minSpacing: 0, minY: preferredTapY, maxY: preferredTapY } : {}
+    );
+    sourceTap = tap;
+    if (gapRoute) {
+      points = routeThroughGapPoints(tap, targetPin, approachX, gapRoute.y);
+      metadata = {
+        ...metadata,
+        routingFallback: "and-gap-corridor",
+        fallbackGapY: gapRoute.y,
+        fallbackGapBetween: [gapRoute.upper, gapRoute.lower]
+      };
+    } else {
+      const laneX = Math.round((tap.x + targetPin.x) / 2);
+      points = tap.y === targetPin.y
+        ? [tap, targetPin]
+        : [tap, { x: laneX, y: tap.y }, { x: laneX, y: targetPin.y }, targetPin];
+    }
   } else {
+    const tap = allocateTap(layout, bus, nextTapCoordinate(layout, bus, targetPin, metadata.routingRole || "input", targetComponent), wireId);
+    sourceTap = tap;
     const laneX = tap.x;
     points = laneX === targetPin.x
       ? [tap, targetPin]
@@ -534,9 +765,9 @@ function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}
   return addWire(layout, {
     id: wireId,
     signal,
-    source: tap.id,
+    source: sourceTap.id,
     target: targetReference(targetComponent, pinName),
-    fromPin: tap,
+    fromPin: sourceTap,
     toPin: targetPin,
     points,
     equationTarget: metadata.equationTarget,
@@ -545,6 +776,9 @@ function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}
     targetComponentId: targetComponent.id,
     targetPinName: pinName,
     comesFromBusTap: true,
+    routingFallback: metadata.routingFallback,
+    fallbackGapY: metadata.fallbackGapY,
+    fallbackGapBetween: metadata.fallbackGapBetween,
     preferredRouteDirection: "vertical-branch"
   });
 }
@@ -895,8 +1129,9 @@ function constantSourceXFor(layout, target) {
   const targetPin = layout.targetPins.get(target);
   if (!targetPin) return layout.config.andStageX;
   const targetComponent = layout.componentById.get(targetPin.componentId);
-  if (targetComponent?.kind === "flipFlop") return targetPin.x - 134;
-  if (targetComponent?.kind === "output") return targetPin.x - 108;
+  const { width } = gateSize("CONST");
+  if (targetComponent?.kind === "flipFlop") return targetPin.x - width - 36;
+  if (targetComponent?.kind === "output") return targetPin.x - width - 32;
   return layout.config.andStageX;
 }
 
@@ -1260,6 +1495,40 @@ function createFeedbackPullbackWires(layout) {
         preferredRouteDirection: usesReturn ? "right-up-left-down" : "right-up-left-to-or-branch",
         feedbackOrderIndex: bus.orderIndex
       });
+      if (upperTaps.length) {
+        const trunkX = finalUpperX;
+        const trunkBottomY = Math.max(...upperTaps.map((tap) => tap.y));
+        if (trunkBottomY > bus.topY) {
+          const trunkStart = {
+            id: `${bus.id}-or-trunk-source`,
+            busId: bus.id,
+            signal: bus.signal,
+            netId: bus.signal,
+            x: trunkX,
+            y: bus.topY,
+            assignedWireId: `wire-${ff.id}-${item.pinName}-feedback-or-trunk`,
+            minSpacing: layout.config.tapPointSpacing,
+            section: "or-trunk-source",
+            renderDot: false
+          };
+          bus.tapPoints.push(trunkStart);
+          layout.tapPoints.push(trunkStart);
+          addWire(layout, {
+            id: `wire-${ff.id}-${item.pinName}-feedback-or-trunk`,
+            signal: item.signal,
+            source: trunkStart.id,
+            target: `${bus.id}.or-trunk`,
+            fromPin: trunkStart,
+            toPin: { x: trunkX, y: trunkBottomY },
+            points: [trunkStart, { x: trunkX, y: trunkBottomY }],
+            routingRole: "feedback-or-trunk",
+            sourceComponentId: bus.id,
+            targetComponentId: bus.id,
+            preferredRouteDirection: "vertical-or-trunk",
+            feedbackOrderIndex: bus.orderIndex
+          });
+        }
+      }
     });
   });
 }
@@ -1280,9 +1549,11 @@ function finalizeTapRendering(layout) {
       tap.renderDot = branchCount > 0;
     } else if (bus?.signalClass === "feedback") {
       if (tap.section === "upper") {
-        const minX = Math.min(bus.riseX ?? tap.x, bus.start?.x ?? tap.x);
-        const maxX = Math.max(bus.riseX ?? tap.x, bus.start?.x ?? tap.x);
-        tap.renderDot = branchCount > 0 && tap.x > minX && tap.x < maxX;
+        const sameTrunkTaps = (bus.upperTapPoints || [])
+          .filter((item) => Math.round(item.x) === Math.round(tap.x))
+          .sort((left, right) => left.y - right.y);
+        const lowestTapY = sameTrunkTaps.length ? Math.max(...sameTrunkTaps.map((item) => item.y)) : tap.y;
+        tap.renderDot = branchCount > 0 && sameTrunkTaps.length > 1 && tap.y < lowestTapY;
       } else if (tap.section === "return") {
         const minY = Math.min(bus.start?.y ?? tap.y, bus.end?.y ?? tap.y);
         const maxY = Math.max(bus.start?.y ?? tap.y, bus.end?.y ?? tap.y);

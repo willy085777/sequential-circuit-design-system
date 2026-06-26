@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Header from "./components/Header.jsx";
 import InputPanel from "./components/InputPanel.jsx";
 import OutputEquations from "./components/OutputEquations.jsx";
@@ -15,7 +15,7 @@ import { D_EXAMPLE, JK_EXAMPLE } from "./utils/examples.js";
 import { parseVariables, validateStateTable } from "./utils/validation.js";
 import { encodeStates } from "./utils/stateEncoding.js";
 import { generateCircuitAnalysis } from "./utils/truthTable.js";
-import { autoDebugCircuitLayout, generateDiagramSvg } from "./utils/diagramGenerator.js";
+import { generateDiagramSvg } from "./utils/diagramGenerator.js";
 import { generateEquationNetlistVerilog, generateTestbench, generateVerilog } from "./utils/verilogGenerator.js";
 import { generateReportHtml } from "./utils/reportGenerator.js";
 import { buildValidationCards, createSimulationTrace, defaultInputSequence } from "./utils/simulation.js";
@@ -89,15 +89,6 @@ const tabs = [
   { id: "validation", label: "Validation" }
 ];
 
-function circuitSvgStatus(svg = "") {
-  if (!svg) return "missing";
-  const dataStatus = svg.match(/data-circuit-validation="([^"]+)"/)?.[1];
-  if (dataStatus === "valid" || dataStatus === "invalid") return dataStatus;
-  if (svg.includes("Layout validation: valid")) return "valid";
-  if (svg.includes("Layout validation: invalid") || svg.includes("Layout validation: failed")) return "invalid";
-  return "unknown";
-}
-
 export default function App() {
   const [modelType, setModelType] = useState("Mealy");
   const [flipFlopType, setFlipFlopType] = useState("JK");
@@ -108,8 +99,6 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [showAbout, setShowAbout] = useState(false);
   const [activeTab, setActiveTab] = useState("state");
-  const [debugDiagramSvg, setDebugDiagramSvg] = useState("");
-  const [autoDebugResult, setAutoDebugResult] = useState(null);
 
   const generatedDiagramSvg = useMemo(() => {
     if (!result) return "";
@@ -121,15 +110,7 @@ export default function App() {
       outputVariables: result.outputVariables
     });
   }, [result, modelType, flipFlopType]);
-  const generatedDiagramStatus = circuitSvgStatus(generatedDiagramSvg);
-  const debugDiagramStatus = circuitSvgStatus(debugDiagramSvg);
-  const shouldUseDebugDiagram = Boolean(debugDiagramSvg) && !(generatedDiagramStatus === "valid" && debugDiagramStatus !== "valid");
-  const diagramSvg = shouldUseDebugDiagram ? debugDiagramSvg : generatedDiagramSvg;
-
-  useEffect(() => {
-    setDebugDiagramSvg("");
-    setAutoDebugResult(null);
-  }, [generatedDiagramSvg]);
+  const diagramSvg = generatedDiagramSvg;
 
   const verilogCode = useMemo(() => {
     if (!result) return "";
@@ -268,29 +249,6 @@ export default function App() {
     downloadText("sequential-circuit-diagram.svg", diagramSvg, "image/svg+xml");
   }
 
-  function runAutoDebug() {
-    if (!result) {
-      setAutoDebugResult({
-        passed: false,
-        attemptsUsed: 0,
-        errorsBefore: ["Generate results before running Auto Debug."],
-        errorsAfter: ["No generated circuit layout is available."],
-        warnings: [],
-        fixes: []
-      });
-      return;
-    }
-    const debugResult = autoDebugCircuitLayout({
-      result,
-      modelType,
-      flipFlopType,
-      inputVariables: result.inputVariables,
-      outputVariables: result.outputVariables
-    });
-    setAutoDebugResult(debugResult);
-    if (debugResult.svg) setDebugDiagramSvg(debugResult.svg);
-  }
-
   async function downloadDiagramPng() {
     if (!diagramSvg) {
       setMessages({ errors: ["Generate results before downloading the diagram."], warnings: [] });
@@ -359,7 +317,6 @@ export default function App() {
               <span className={`mini-badge ${diagramSvg.includes("Layout validation: valid") ? "success" : "warning"}`}>
                 Circuit Graph {diagramSvg.includes("Layout validation: valid") ? "PASS" : "CHECK"}
               </span>
-              <button onClick={runAutoDebug}>Run Auto Debug</button>
               <button onClick={downloadDiagram}>Download SVG</button>
               <button onClick={downloadDiagramPng}>Download PNG</button>
             </div>
@@ -403,8 +360,6 @@ export default function App() {
         diagramSvg={diagramSvg}
         verilogCode={verilogCode}
         validationReport={validationReport}
-        onAutoDebug={runAutoDebug}
-        autoDebugResult={autoDebugResult}
       />
     );
   }

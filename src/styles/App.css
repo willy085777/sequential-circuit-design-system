@@ -1079,58 +1079,6 @@ pre {
   gap: 8px;
 }
 
-.auto-debug-result {
-  border: 1px solid #d6e1ef;
-  border-radius: 12px;
-  padding: 14px;
-  margin-bottom: 14px;
-  background: #fbfdff;
-}
-
-.auto-debug-result.pass {
-  border-color: #addfbe;
-  background: #f5fcf7;
-}
-
-.auto-debug-result.fail {
-  border-color: #efb8b8;
-  background: #fff7f7;
-}
-
-.auto-debug-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  color: #183f6b;
-  margin-bottom: 10px;
-}
-
-.auto-debug-columns {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 12px;
-}
-
-.auto-debug-columns h3 {
-  margin: 0 0 6px;
-  font-size: 13px;
-  color: #315574;
-}
-
-.auto-debug-columns ul {
-  margin: 0;
-  padding-left: 18px;
-  color: #637184;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.auto-debug-columns p {
-  margin: 0;
-  color: #637184;
-  font-size: 12px;
-}
-
 .validation-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));

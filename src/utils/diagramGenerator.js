@@ -1969,16 +1969,12 @@ function renderPin(component) {
 
 function renderConstant(component) {
   const pin = component.pinMap.out;
-  if (component.value === "1") {
-    return `<path d="M${pin.x - 24} ${pin.y + 22} V${pin.y}" stroke="${COLORS.const}" stroke-width="2.4"/>
-      <path d="M${pin.x - 42} ${pin.y + 22} H${pin.x - 6}" stroke="${COLORS.const}" stroke-width="2.4"/>
-      <text x="${pin.x - 32}" y="${pin.y - 12}" font-size="${SIZES.constant}" font-weight="800" font-family="${SVG_FONT}" fill="${COLORS.const}">1</text>`;
-  }
-  return `<path d="M${pin.x - 24} ${pin.y - 20} V${pin.y}" stroke="${COLORS.const}" stroke-width="2.4"/>
-    <path d="M${pin.x - 42} ${pin.y} H${pin.x - 6}" stroke="${COLORS.const}" stroke-width="2.4"/>
-    <path d="M${pin.x - 36} ${pin.y + 8} H${pin.x - 12}" stroke="${COLORS.const}" stroke-width="2.4"/>
-    <path d="M${pin.x - 30} ${pin.y + 16} H${pin.x - 18}" stroke="${COLORS.const}" stroke-width="2.4"/>
-    <text x="${pin.x - 32}" y="${pin.y - 30}" font-size="${SIZES.constant}" font-weight="800" font-family="${SVG_FONT}" fill="${COLORS.const}">0</text>`;
+  const value = component.value === "0" ? "0" : "1";
+  const stubLength = 20;
+  const startX = pin.x - stubLength;
+  const labelX = startX - 7;
+  return `<path d="M${startX} ${pin.y} H${pin.x}" stroke="${COLORS.const}" stroke-width="2.4"/>
+    <text x="${labelX}" y="${pin.y + 5}" text-anchor="end" font-size="${SIZES.constant}" font-weight="800" font-family="${SVG_FONT}" fill="${COLORS.const}">${value}</text>`;
 }
 
 function renderNot(component) {

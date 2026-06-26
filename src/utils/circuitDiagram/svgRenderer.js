@@ -155,19 +155,12 @@ function renderNotGate(component) {
 function renderConstant(component) {
   const pin = component.pins.out;
   const value = component.id.includes("const-0") ? "0" : "1";
-  if (value === "1") {
-    return `<g data-component-id="${escapeHtml(component.id)}">
-      <path d="M${pin.x - 24} ${pin.y + 22} V${pin.y}" stroke="${COLORS.constant}" stroke-width="2.4"/>
-      <path d="M${pin.x - 42} ${pin.y + 22} H${pin.x - 6}" stroke="${COLORS.constant}" stroke-width="2.4"/>
-      <text x="${pin.x - 34}" y="${pin.y - 12}" font-size="18" font-weight="900" font-family="${FONT}" fill="${COLORS.constant}">1</text>
-    </g>`;
-  }
+  const stubLength = 20;
+  const startX = pin.x - stubLength;
+  const labelX = startX - 7;
   return `<g data-component-id="${escapeHtml(component.id)}">
-    <path d="M${pin.x - 24} ${pin.y - 20} V${pin.y}" stroke="${COLORS.constant}" stroke-width="2.4"/>
-    <path d="M${pin.x - 42} ${pin.y} H${pin.x - 6}" stroke="${COLORS.constant}" stroke-width="2.4"/>
-    <path d="M${pin.x - 36} ${pin.y + 8} H${pin.x - 12}" stroke="${COLORS.constant}" stroke-width="2.4"/>
-    <path d="M${pin.x - 30} ${pin.y + 16} H${pin.x - 18}" stroke="${COLORS.constant}" stroke-width="2.4"/>
-    <text x="${pin.x - 34}" y="${pin.y - 30}" font-size="18" font-weight="900" font-family="${FONT}" fill="${COLORS.constant}">0</text>
+    <path d="M${startX} ${pin.y} H${pin.x}" stroke="${COLORS.constant}" stroke-width="2.4"/>
+    <text x="${labelX}" y="${pin.y + 5}" text-anchor="end" font-size="18" font-weight="900" font-family="${FONT}" fill="${COLORS.constant}">${value}</text>
   </g>`;
 }
 
