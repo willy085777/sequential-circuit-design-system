@@ -16,6 +16,7 @@ const DEFAULT_LAYOUT = {
   andGateIntraGroupGap: 52,
   andGateInterGroupGap: 96,
   equationGroupSpacing: 110,
+  outputLaneYOffsetMultiplier: 1.5,
   feedbackBusSpacing: 42,
   tapPointSpacing: 40,
   branchLaneSpacing: 24,
@@ -630,10 +631,23 @@ function routeThroughGapPoints(sourcePoint, targetPin, approachX, gapY) {
   ]);
 }
 
-function standardFlipFlopInputRoute(sourcePoint, targetPin, targetComponent) {
+function routeBranchFromOrderedLaneThroughGapPoints(sourcePoint, targetPin, approachX, gapY, branchLaneX) {
+  return compactPoints([
+    sourcePoint,
+    { x: branchLaneX, y: sourcePoint.y },
+    { x: branchLaneX, y: gapY },
+    { x: approachX, y: gapY },
+    { x: approachX, y: targetPin.y },
+    targetPin
+  ]);
+}
+
+function standardFlipFlopInputRoute(sourcePoint, targetPin, targetComponent, laneY = null) {
   const approachX = targetPin.x - 54;
   const targetCenter = centerY(targetComponent);
-  const safeY = targetPin.y >= targetCenter ? targetPin.y + 70 : targetPin.y - 70;
+  const safeY = Number.isFinite(laneY)
+    ? Math.round(laneY)
+    : targetPin.y >= targetCenter ? targetPin.y + 70 : targetPin.y - 70;
   return {
     approachX,
     safeY,
@@ -690,6 +704,152 @@ function chooseAndGapRoute(layout, signal, sourcePoint, targetPin, targetCompone
     .find((candidate) => !routeHitsProtectedComponent(layout, candidate.points, new Set([targetComponent.id])));
 }
 
+function isInputDistributionBus(bus) {
+  return bus?.signalClass === "input" || bus?.signalClass === "input-inverted";
+}
+
+function groupNearbyDirectInputSlots(layout, slots) {
+  const naturalCorridorGap = Math.max(72, layout.config.equationGroupSpacing);
+  const targetCorridorGap = Math.max(
+    naturalCorridorGap,
+    layout.config.ffVerticalSpacing + Math.round(layout.config.ffHeight * 0.5)
+  );
+  const sharedTargetXGap = Math.max(18, Math.round(layout.config.ffWidth * 0.25));
+  const ordered = [...slots].sort((left, right) =>
+    left.targetX - right.targetX
+    || left.targetY - right.targetY
+    || left.naturalY - right.naturalY
+  );
+  const groups = [];
+  ordered.forEach((slot) => {
+    const group = groups[groups.length - 1];
+    const previous = group?.[group.length - 1];
+    const sharesTargetCorridor = previous
+      && Math.abs(slot.targetX - previous.targetX) <= sharedTargetXGap
+      && Math.abs(slot.targetY - previous.targetY) <= targetCorridorGap;
+    const sharesNaturalCorridor = previous
+      && Math.abs(slot.naturalY - previous.naturalY) <= naturalCorridorGap;
+    if (!group || (!sharesTargetCorridor && !sharesNaturalCorridor)) {
+      groups.push([slot]);
+    } else {
+      group.push(slot);
+    }
+  });
+  return groups;
+}
+
+function sharedOpenAndGapForDirectInputGroup(layout, group) {
+  if (group.length < 2) return null;
+  const averageTargetY = group.reduce((total, slot) => total + slot.targetY, 0) / group.length;
+  const candidateMap = new Map();
+  group.forEach((slot) => {
+    const targetPin = { x: slot.targetX, y: slot.targetY };
+    const approachX = slot.targetX - 54;
+    openAndGapCandidates(layout, targetPin, approachX).forEach((candidate) => {
+      const key = `${candidate.upper}|${candidate.lower}`;
+      const existing = candidateMap.get(key) || { ...candidate, count: 0 };
+      existing.count += 1;
+      candidateMap.set(key, existing);
+    });
+  });
+  return [...candidateMap.values()]
+    .filter((candidate) => candidate.count === group.length)
+    .sort((left, right) =>
+      Math.abs(left.y - averageTargetY) - Math.abs(right.y - averageTargetY)
+      || left.y - right.y
+    )[0] || null;
+}
+
+function distributeLaneYsInOpenGap(gap, count, minGap) {
+  if (!gap || count < 1) return [];
+  if (count === 1) return [Math.round(gap.y)];
+  const available = Math.max(1, gap.bottom - gap.top);
+  const edgePadding = Math.min(16, Math.max(8, Math.floor(available / (count + 2))));
+  const top = gap.top + edgePadding;
+  const bottom = gap.bottom - edgePadding;
+  const requiredSpan = minGap * (count - 1);
+  const availableSpan = bottom - top;
+  if (availableSpan >= requiredSpan) {
+    const start = clamp(gap.y - requiredSpan / 2, top, bottom - requiredSpan);
+    return Array.from({ length: count }, (_, index) => Math.round(start + index * minGap));
+  }
+  const step = count === 1 ? 0 : availableSpan / (count - 1);
+  return Array.from({ length: count }, (_, index) => Math.round(top + index * step));
+}
+
+function assignOrderedDirectInputLaneYs(layout, group) {
+  if (group.length < 2) return group;
+  const minGap = Math.max(24, layout.config.branchLaneSpacing);
+  const byTargetHeight = [...group].sort((left, right) =>
+    left.targetY - right.targetY
+    || left.targetX - right.targetX
+    || left.signal.localeCompare(right.signal)
+  );
+  const sharedGap = sharedOpenAndGapForDirectInputGroup(layout, byTargetHeight);
+  const orderedLaneYs = sharedGap
+    ? distributeLaneYsInOpenGap(sharedGap, byTargetHeight.length, minGap)
+    : group
+      .map((slot) => Number.isFinite(slot.targetY) ? slot.targetY : slot.naturalY)
+      .sort((left, right) => left - right);
+  if (!sharedGap) {
+    for (let index = 1; index < orderedLaneYs.length; index += 1) {
+      if (orderedLaneYs[index] - orderedLaneYs[index - 1] < minGap) {
+        orderedLaneYs[index] = orderedLaneYs[index - 1] + minGap;
+      }
+    }
+  }
+  return byTargetHeight.map((slot, index) => ({
+    ...slot,
+    orderedLaneY: orderedLaneYs[index],
+    corridorIndex: index,
+    selectedGapY: sharedGap?.y,
+    selectedGapTop: sharedGap?.top,
+    selectedGapBottom: sharedGap?.bottom,
+    selectedGapBetween: sharedGap ? [sharedGap.upper, sharedGap.lower] : undefined
+  }));
+}
+
+function prepareDirectInputFlipFlopBranchSlots(layout) {
+  const slots = [];
+  layout.equationLayouts.forEach((equationLayout) => {
+    const sourceRef = equationLayout.finalSourceRef;
+    if (sourceRef?.kind !== "direct") return;
+    const bus = layout.busBySignal.get(sourceRef.sourceSignal);
+    if (!isInputDistributionBus(bus)) return;
+    const targetPin = layout.targetPins.get(equationLayout.target);
+    const targetComponent = targetPin ? layout.componentById.get(targetPin.componentId) : null;
+    if (targetComponent?.kind !== "flipFlop") return;
+    const wireId = `wire-${sanitizeId(sourceRef.sourceSignal)}-to-target-${sanitizeId(equationLayout.target)}`;
+    const sourcePoint = { x: bus.x ?? bus.start?.x ?? targetPin.x, y: targetPin.y };
+    const standardRoute = standardFlipFlopInputRoute(sourcePoint, targetPin, targetComponent);
+    slots.push({
+      wireId,
+      signal: sourceRef.sourceSignal,
+      target: equationLayout.target,
+      targetPinName: targetPin.pinName,
+      targetComponentId: targetComponent.id,
+      targetX: targetPin.x,
+      targetY: targetPin.y,
+      naturalY: standardRoute.safeY
+    });
+  });
+
+  layout.directInputFlipFlopBranchSlots = new Map();
+  layout.validationHints.directInputFlipFlopBranchSlots = [];
+  groupNearbyDirectInputSlots(layout, slots).forEach((group, groupIndex) => {
+    assignOrderedDirectInputLaneYs(layout, group).forEach((slot) => {
+      const orderedSlot = {
+        ...slot,
+        corridorId: `direct-input-ff-${groupIndex}`,
+        orderedLaneY: Math.round(slot.orderedLaneY ?? slot.naturalY),
+        selectedGapY: Number.isFinite(slot.selectedGapY) ? Math.round(slot.selectedGapY) : undefined
+      };
+      layout.directInputFlipFlopBranchSlots.set(slot.wireId, orderedSlot);
+      layout.validationHints.directInputFlipFlopBranchSlots.push(orderedSlot);
+    });
+  });
+}
+
 function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}) {
   const bus = layout.busBySignal.get(signal);
   const targetPin = targetComponent.pins[pinName];
@@ -701,22 +861,40 @@ function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}
   let points;
   let sourceTap;
   if (targetComponent.kind === "flipFlop") {
-    const initialTapPoint = { x: bus.x ?? bus.start?.x ?? targetPin.x, y: targetPin.y };
-    const standardRoute = standardFlipFlopInputRoute(initialTapPoint, targetPin, targetComponent);
+    const directInputSlot = layout.directInputFlipFlopBranchSlots?.get(wireId);
+    const directInputLaneY = Number.isFinite(directInputSlot?.orderedLaneY)
+      ? directInputSlot.orderedLaneY
+      : null;
+    const initialTapPoint = {
+      x: bus.x ?? bus.start?.x ?? targetPin.x,
+      y: Number.isFinite(directInputLaneY) ? directInputLaneY : targetPin.y
+    };
+    const standardRoute = standardFlipFlopInputRoute(initialTapPoint, targetPin, targetComponent, directInputLaneY);
     const gapRoute = routeNeedsFallback(layout, signal, standardRoute.points, targetComponent)
       ? chooseAndGapRoute(layout, signal, initialTapPoint, targetPin, targetComponent, standardRoute.approachX)
       : null;
-    const preferredTapY = gapRoute?.y ?? standardRoute.safeY;
-    const tap = allocateTap(layout, bus, preferredTapY, wireId, gapRoute ? { minSpacing: 0, minY: preferredTapY, maxY: preferredTapY } : {});
+    const preferredTapY = Number.isFinite(directInputLaneY)
+      ? directInputLaneY
+      : gapRoute?.y ?? standardRoute.safeY;
+    const lockTapToLane = Boolean(gapRoute || Number.isFinite(directInputLaneY));
+    const tap = allocateTap(layout, bus, preferredTapY, wireId, lockTapToLane ? { minSpacing: 0, minY: preferredTapY, maxY: preferredTapY } : {});
     sourceTap = tap;
+    const branchLaneX = Math.min(
+      standardRoute.approachX - layout.config.branchLaneSpacing,
+      Math.max(tap.x + layout.config.branchLaneSpacing, layout.config.andStageX - layout.config.branchLaneSpacing)
+    );
     points = gapRoute
-      ? routeThroughGapPoints(tap, targetPin, standardRoute.approachX, gapRoute.y)
-      : standardFlipFlopInputRoute(tap, targetPin, targetComponent).points;
+      ? routeBranchFromOrderedLaneThroughGapPoints(tap, targetPin, standardRoute.approachX, gapRoute.y, branchLaneX)
+      : standardFlipFlopInputRoute(tap, targetPin, targetComponent, preferredTapY).points;
     metadata = {
       ...metadata,
       routingFallback: gapRoute ? "and-gap-corridor" : undefined,
       fallbackGapY: gapRoute?.y,
-      fallbackGapBetween: gapRoute ? [gapRoute.upper, gapRoute.lower] : undefined
+      fallbackGapBetween: gapRoute ? [gapRoute.upper, gapRoute.lower] : undefined,
+      directInputBranchCorridor: directInputSlot?.corridorId,
+      directInputBranchOrder: directInputSlot?.corridorIndex,
+      directInputTargetY: directInputSlot?.targetY,
+      directInputOrderedLaneY: directInputSlot?.orderedLaneY
     };
   } else if (bus.orientation === "vertical") {
     const preferredCoordinate = nextTapCoordinate(layout, bus, targetPin, metadata.routingRole || "input", targetComponent);
@@ -779,6 +957,10 @@ function addBusToPinWire(layout, signal, targetComponent, pinName, metadata = {}
     routingFallback: metadata.routingFallback,
     fallbackGapY: metadata.fallbackGapY,
     fallbackGapBetween: metadata.fallbackGapBetween,
+    directInputBranchCorridor: metadata.directInputBranchCorridor,
+    directInputBranchOrder: metadata.directInputBranchOrder,
+    directInputTargetY: metadata.directInputTargetY,
+    directInputOrderedLaneY: metadata.directInputOrderedLaneY,
     preferredRouteDirection: "vertical-branch"
   });
 }
@@ -867,6 +1049,7 @@ function createLayoutShell(netlist, result, options) {
     componentById: new Map(),
     targetPins: new Map(),
     sourceBySignal: new Map(),
+    directInputFlipFlopBranchSlots: new Map(),
     feedbackBranchCursor: 0,
     feedbackOrBranchCursor: 0,
     equationLayouts: [],
@@ -1317,6 +1500,11 @@ function isOutputTarget(layout, target) {
   return layout.meta.outputVariables.includes(target) || /^Z\d*$/.test(target);
 }
 
+function outputLaneYFor(layout, outputIndex = 0) {
+  const startY = layout.validationHints.outputStartY ?? 0;
+  return Math.round(startY + outputIndex * layout.config.equationGroupSpacing);
+}
+
 function centeredOrY(layout, equationLayout, refs) {
   const andRefs = refs
     .filter((ref) => ref.kind === "and")
@@ -1329,6 +1517,102 @@ function centeredOrY(layout, equationLayout, refs) {
   const flipFlopBottom = Math.max(0, ...(layout.flipFlops || []).map((ff) => ff.y + ff.height));
   const minCenter = flipFlopBottom + 80 + gateHeight / 2;
   return Math.round(Math.max(centroid, minCenter));
+}
+
+function refreshTermRefFromComponent(layout, ref) {
+  const component = layout.componentById.get(ref.componentId);
+  if (!component?.pins?.out) return;
+  ref.sourceY = component.pins.out.y;
+  ref.sourceX = component.pins.out.x;
+}
+
+function andGroupHeight(layout, gates) {
+  if (!gates.length) return 0;
+  return gates.reduce((total, gate) => total + gate.height, 0)
+    + Math.max(0, gates.length - 1) * layout.config.andGateIntraGroupGap;
+}
+
+function placeAndGroupAroundCenter(layout, refs, center) {
+  const gates = refs
+    .map((ref) => layout.componentById.get(ref.componentId))
+    .filter(Boolean);
+  if (!gates.length) return null;
+  const groupHeight = andGroupHeight(layout, gates);
+  let y = Math.round(center - groupHeight / 2);
+  gates.forEach((gate, index) => {
+    if (index > 0) y += gates[index - 1].height + layout.config.andGateIntraGroupGap;
+    updateComponentGeometry(layout, gate, gate.x, y);
+    const ref = refs.find((item) => item.componentId === gate.id);
+    if (ref) refreshTermRefFromComponent(layout, ref);
+  });
+  return {
+    top: gates[0].y,
+    bottom: gates[gates.length - 1].y + gates[gates.length - 1].height,
+    center,
+    height: groupHeight
+  };
+}
+
+function equationGroupHeight(layout, equationLayout, orGate) {
+  const andGates = equationLayout.termRefs
+    .filter((ref) => ref.kind === "and")
+    .map((ref) => layout.componentById.get(ref.componentId))
+    .filter(Boolean);
+  return Math.max(andGroupHeight(layout, andGates), orGate?.height ?? 0);
+}
+
+function placeEquationGroupsByTargetOrder(layout) {
+  const orderedGroups = layout.equationLayouts
+    .map((equationLayout) => ({
+      equationLayout,
+      orGate: equationLayout.orComponentId ? layout.componentById.get(equationLayout.orComponentId) : null,
+      outputIndex: layout.meta.outputVariables.findIndex((output) => output === equationLayout.target)
+    }))
+    .filter(({ equationLayout, orGate }) =>
+      Boolean(orGate)
+      || equationLayout.termRefs.some((ref) => ref.kind === "and")
+      || isOutputTarget(layout, equationLayout.target)
+    )
+    .sort((left, right) =>
+      targetSortRank(left.equationLayout.target, layout.meta.outputVariables)
+      - targetSortRank(right.equationLayout.target, layout.meta.outputVariables)
+    );
+  if (!orderedGroups.length) return;
+
+  let cursorBottom = -Infinity;
+
+  orderedGroups.forEach(({ equationLayout, orGate, outputIndex }) => {
+    const andRefs = equationLayout.termRefs.filter((ref) => ref.kind === "and");
+    const groupHeight = equationGroupHeight(layout, equationLayout, orGate);
+    const preferredCenter = isOutputTarget(layout, equationLayout.target)
+      ? outputLaneYFor(layout, Math.max(0, outputIndex))
+      : equationLayout.targetRow;
+    const minCenter = Number.isFinite(cursorBottom) && groupHeight
+      ? cursorBottom + layout.config.andGateInterGroupGap + groupHeight / 2
+      : preferredCenter;
+    const anchoredCenter = Math.round(Math.max(preferredCenter, minCenter));
+
+    alignOutputTargetToY(layout, equationLayout.target, anchoredCenter);
+
+    if (orGate) {
+      updateComponentGeometry(layout, orGate, orGate.x, Math.round(anchoredCenter - orGate.height / 2));
+      equationLayout.finalSourceRef = {
+        ...equationLayout.finalSourceRef,
+        sourceY: orGate.pins.out.y,
+        sourceX: orGate.pins.out.x
+      };
+    }
+
+    const placedGroup = placeAndGroupAroundCenter(layout, andRefs, anchoredCenter);
+    equationLayout.targetRow = anchoredCenter;
+    layout.validationHints.targetRows[equationLayout.target] = anchoredCenter;
+    const placedBottom = Math.max(
+      placedGroup?.bottom ?? -Infinity,
+      orGate ? orGate.y + orGate.height : -Infinity,
+      groupHeight ? anchoredCenter + groupHeight / 2 : anchoredCenter
+    );
+    cursorBottom = Math.max(cursorBottom, placedBottom);
+  });
 }
 
 function alignOutputTargetToY(layout, target, y) {
@@ -1350,6 +1634,26 @@ function orToFlipFlopLaneSpacing(layout) {
   return Math.max(24, layout.config.branchLaneSpacing);
 }
 
+function jkFlipFlopInputLaneRole(target) {
+  const match = String(target || "").match(/^([JK])\d+$/);
+  if (!match) return null;
+  return match[1] === "J" ? "upper-or-output" : "lower-or-output";
+}
+
+function preferredJkOrToFlipFlopLaneX(layout, sourceComponent, targetComponent, equationTarget) {
+  const laneRole = jkFlipFlopInputLaneRole(equationTarget);
+  if (!laneRole) return null;
+  const clockMiddleX = localClockLaneXForFlipFlopInputs(layout, targetComponent);
+  const laneSpacing = orToFlipFlopLaneSpacing(layout);
+  const sourceOutX = sourceComponent?.pins?.out?.x ?? sourceComponent?.protectedBox?.right ?? layout.config.orStageX;
+  const sourceClearX = sourceOutX + Math.max(12, laneSpacing);
+  const targetLimitX = targetComponent.x - 10;
+  if (laneRole === "upper-or-output") {
+    return clamp(clockMiddleX - laneSpacing * 2, sourceClearX, Math.min(clockMiddleX - 1, targetLimitX));
+  }
+  return clamp(clockMiddleX + laneSpacing, Math.max(sourceClearX, clockMiddleX + 1), targetLimitX);
+}
+
 function preferredFinalTargetLaneX(layout, sourceRef, targetComponent, equationTarget = null) {
   if (targetComponent?.kind === "output") {
     return Math.round((layout.config.orStageX + layout.config.outputStageX) / 2);
@@ -1357,6 +1661,8 @@ function preferredFinalTargetLaneX(layout, sourceRef, targetComponent, equationT
   if (sourceRef?.kind === "or") {
     const sourceComponent = layout.componentById.get(sourceRef.componentId);
     if (targetComponent?.kind === "flipFlop") {
+      const jkLaneX = preferredJkOrToFlipFlopLaneX(layout, sourceComponent, targetComponent, equationTarget);
+      if (Number.isFinite(jkLaneX)) return jkLaneX;
       const orToFlipFlopTargets = layout.equationLayouts
         .filter((entry) => {
           const targetPin = layout.targetPins.get(entry.target);
@@ -1820,7 +2126,8 @@ function layoutDimensions(layout, targetOrder) {
   const ffBottomY = config.ffTopY + (ffCount - 1) * config.ffVerticalSpacing + config.ffHeight;
   const feedbackBusCount = Math.max(4, meta.feedbackBusOrder.length);
   const feedbackStartY = 56;
-  const outputStartY = ffBottomY + 118;
+  const outputLaneOffset = Math.round(118 * config.outputLaneYOffsetMultiplier);
+  const outputStartY = ffBottomY + outputLaneOffset;
   const outputRows = Math.max(1, targetOrder.filter((target) => meta.outputVariables.includes(target) || /^Z\d*$/.test(target)).length);
   const logicBottomY = outputStartY + (outputRows - 1) * config.equationGroupSpacing + 90;
   const clockY = logicBottomY + config.clkBusYMargin;
@@ -1833,6 +2140,7 @@ function layoutDimensions(layout, targetOrder) {
     feedbackBusCount,
     feedbackStartY,
     outputStartY,
+    outputLaneOffset,
     logicBottomY,
     clockY,
     feedbackEndX,
@@ -1843,7 +2151,7 @@ function layoutDimensions(layout, targetOrder) {
 }
 
 function makeSerializableLayout(layout) {
-  const { busBySignal, componentById, targetPins, sourceBySignal, ...serializable } = layout;
+  const { busBySignal, componentById, targetPins, sourceBySignal, directInputFlipFlopBranchSlots, ...serializable } = layout;
   serializable.equationLayouts = layout.equationLayouts.map((entry) => ({
     target: entry.target,
     targetRow: entry.targetRow,
@@ -1864,6 +2172,8 @@ export function buildCircuitLayout({ netlist, result = null, inputVariables = []
   layout.height = dimensions.height;
   layout.validationHints.targetOrder = targetOrder;
   layout.validationHints.targetRows = {};
+  layout.validationHints.outputStartY = dimensions.outputStartY;
+  layout.validationHints.outputLaneOffset = dimensions.outputLaneOffset;
   defineRegions(layout, dimensions);
 
   createInputBuses(layout, actualNetlist, dimensions);
@@ -1879,7 +2189,8 @@ export function buildCircuitLayout({ netlist, result = null, inputVariables = []
   createProductTermLayouts(layout, actualNetlist.equations || [], dimensions);
   spreadAndStageByGroups(layout);
   createOrStages(layout);
-  spreadStage(layout, 2, layout.config.gateVerticalSpacing);
+  placeEquationGroupsByTargetOrder(layout);
+  prepareDirectInputFlipFlopBranchSlots(layout);
 
   createEquationWires(layout);
   finalizeInputBusExtents(layout);

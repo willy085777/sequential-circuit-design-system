@@ -10,6 +10,32 @@ function orderRank(order, signal) {
   return index >= 0 ? index : order.length + 100;
 }
 
+function numericSuffix(value) {
+  const match = String(value || "").match(/(\d+)$/);
+  return match ? Number(match[1]) : 0;
+}
+
+function targetSortRank(target, outputVariables = []) {
+  if (outputVariables.includes(target) || /^Z\d*$/.test(String(target || ""))) return 1000 + numericSuffix(target);
+  const letter = String(target || "").replace(/\d+$/, "");
+  const suffix = numericSuffix(target);
+  const letterRank = { D: 0, T: 0, J: 0, K: 1 }[letter] ?? 5;
+  return suffix * 10 + letterRank;
+}
+
+function jkFlipFlopInputLaneRole(target) {
+  const match = String(target || "").match(/^([JK])\d+$/);
+  if (!match) return null;
+  return match[1] === "J" ? "upper-or-output" : "lower-or-output";
+}
+
+function flipFlopInputLaneRank(entry) {
+  const role = jkFlipFlopInputLaneRole(entry.wire?.equationTarget);
+  if (role === "upper-or-output") return 0;
+  if (role === "lower-or-output") return 2;
+  return 1 + centerY(entry.source) / 10000;
+}
+
 function isFeedbackSignal(signal) {
   return /^Q\d+'?$/.test(String(signal || ""));
 }
@@ -751,6 +777,24 @@ function validateAndGroupingByOrTarget(layout, errors) {
   });
 }
 
+function validateOrGroupTargetOrdering(layout, errors) {
+  const outputVariables = layout.meta?.outputVariables || layout.metadata?.outputVariables || [];
+  const orGates = (layout.gates || [])
+    .filter((gate) => gate.type === "OR" && gate.equationTarget)
+    .sort((left, right) => centerY(left) - centerY(right));
+  for (let index = 0; index < orGates.length - 1; index += 1) {
+    const current = orGates[index];
+    const next = orGates[index + 1];
+    if (targetSortRank(current.equationTarget, outputVariables) <= targetSortRank(next.equationTarget, outputVariables)) continue;
+    pushIssue(errors, "OR_GROUP_ORDER_ERROR", "OR groups must be ordered top-to-bottom by target J0, K0, J1, K1, then Z", {
+      currentGate: current.id,
+      currentTarget: current.equationTarget,
+      nextGate: next.id,
+      nextTarget: next.equationTarget
+    });
+  }
+}
+
 function primaryVerticalLaneX(wire) {
   const verticalSegments = wireSegments(wire)
     .filter((segment) => segmentOrientation(segment) === "vertical")
@@ -795,7 +839,7 @@ function validateOrOutputLaneOrdering(layout, errors) {
 
   const clkLaneX = localClockLaneX(layout);
   entriesByTarget.forEach((entries, targetId) => {
-    const sorted = [...entries].sort((left, right) => centerY(left.source) - centerY(right.source));
+    const sorted = [...entries].sort((left, right) => flipFlopInputLaneRank(left) - flipFlopInputLaneRank(right));
     for (let index = 0; index < sorted.length - 1; index += 1) {
       const upper = sorted[index];
       const lower = sorted[index + 1];
@@ -806,6 +850,27 @@ function validateOrOutputLaneOrdering(layout, errors) {
         lowerWire: lower.wire.id,
         upperLaneX: upper.laneX,
         lowerLaneX: lower.laneX
+      });
+    }
+    if (Number.isFinite(clkLaneX)) {
+      entries.forEach((entry) => {
+        const role = jkFlipFlopInputLaneRole(entry.wire.equationTarget);
+        if (role === "upper-or-output" && entry.laneX >= clkLaneX) {
+          pushIssue(errors, "OR_OUTPUT_CLK_LANE_ORDER_ERROR", `${entry.wire.equationTarget} OR output lane must be left of CLK`, {
+            target: targetId,
+            wire: entry.wire.id,
+            laneX: entry.laneX,
+            clkLaneX
+          });
+        }
+        if (role === "lower-or-output" && entry.laneX <= clkLaneX) {
+          pushIssue(errors, "OR_OUTPUT_CLK_LANE_ORDER_ERROR", `${entry.wire.equationTarget} OR output lane must be right of CLK`, {
+            target: targetId,
+            wire: entry.wire.id,
+            laneX: entry.laneX,
+            clkLaneX
+          });
+        }
       });
     }
     if (sorted.length < 2 || !Number.isFinite(clkLaneX)) return;
@@ -820,6 +885,44 @@ function validateOrOutputLaneOrdering(layout, errors) {
       clkLaneX,
       lowerLaneX: lower.laneX
     });
+  });
+}
+
+function validateDirectInputFlipFlopBranchOrdering(layout, errors) {
+  const groups = new Map();
+  (layout.wires || [])
+    .filter((wire) =>
+      wire.routingRole === "equation-to-ff-input"
+      && (wire.signalClass === "input" || wire.signalClass === "input-inverted")
+      && wire.directInputBranchCorridor
+    )
+    .forEach((wire) => {
+      if (!groups.has(wire.directInputBranchCorridor)) groups.set(wire.directInputBranchCorridor, []);
+      groups.get(wire.directInputBranchCorridor).push({
+        wire,
+        branchY: wire.points?.[0]?.y ?? wire.sourceY,
+        targetY: Number.isFinite(wire.directInputTargetY) ? wire.directInputTargetY : wire.targetY
+      });
+    });
+
+  groups.forEach((entries, corridorId) => {
+    if (entries.length < 2) return;
+    const sorted = [...entries].sort((left, right) => left.targetY - right.targetY || left.branchY - right.branchY);
+    for (let index = 0; index < sorted.length - 1; index += 1) {
+      const upper = sorted[index];
+      const lower = sorted[index + 1];
+      if (Math.abs(upper.targetY - lower.targetY) <= 1) continue;
+      if (upper.branchY < lower.branchY) continue;
+      pushIssue(errors, "INPUT_BRANCH_ORDER_ERROR", "Direct X/X' branches to flip-flop inputs must follow target-pin height order", {
+        corridorId,
+        upperWire: upper.wire.id,
+        lowerWire: lower.wire.id,
+        upperTargetY: upper.targetY,
+        lowerTargetY: lower.targetY,
+        upperBranchY: upper.branchY,
+        lowerBranchY: lower.branchY
+      });
+    }
   });
 }
 
@@ -1241,7 +1344,9 @@ export function validateDiagramLayout(layout) {
   validateAndToOrRoutingStyle(layout, errors);
   validateOrGroupPlacement(layout, errors);
   validateAndGroupingByOrTarget(layout, errors);
+  validateOrGroupTargetOrdering(layout, errors);
   validateOrOutputLaneOrdering(layout, errors);
+  validateDirectInputFlipFlopBranchOrdering(layout, errors);
   validateReferenceStyle(layout, errors, warnings);
   return publicResult(errors, warnings, {
     componentCount: layout.components?.length || 0,
