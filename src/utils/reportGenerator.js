@@ -14,6 +14,23 @@ function tableHtml(headers, rows) {
     .join("")}</tbody></table>`;
 }
 
+function kmapTableHtml(mapItem) {
+  if (!mapItem) return "";
+  if (mapItem.kmap) {
+    const cellMap = new Map(
+      mapItem.kmap.cells.map((cell) => [`${cell.rowCode}:${cell.columnCode}`, cell.value])
+    );
+    return tableHtml(
+      [mapItem.kmap.header, ...mapItem.kmap.columnCodes],
+      mapItem.kmap.rowCodes.map((rowCode) => [
+        rowCode,
+        ...mapItem.kmap.columnCodes.map((columnCode) => cellMap.get(`${rowCode}:${columnCode}`) || "0")
+      ])
+    );
+  }
+  return tableHtml([...mapItem.variables, "Value"], mapItem.values.map((item) => [...item.code, item.value]));
+}
+
 function groupedStateTableHtml(groupedRows, modelType, inputVariable) {
   const input0 = `${inputVariable}=0`;
   const input1 = `${inputVariable}=1`;
@@ -179,7 +196,7 @@ export function generateReportHtml({
   ${tableHtml(["Output", "Equation"], outputRows)}
   <h2>K-map or Truth-Table Simplification</h2>
   <p>Selected equation: <strong>${display(mapItem?.id || "")}</strong></p>
-  ${mapItem ? tableHtml([...mapItem.variables, "Value"], mapItem.values.map((item) => [...item.code, item.value])) : ""}
+  ${kmapTableHtml(mapItem)}
   <p><strong>Simplified result:</strong> ${display(mapItem?.equation || "")}</p>
   <h2>Sequential Circuit Diagram</h2>
   <div class="diagram">${svg}</div>

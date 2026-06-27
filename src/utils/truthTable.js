@@ -2,12 +2,61 @@ import { allBinaryCodes, simplifySop, valuesForMap } from "./booleanSimplifier.j
 import { excitationForBit, getFlipFlopInputs } from "./excitationTable.js";
 import { bitForStateVariable, codeInVariableOrder } from "./stateEncoding.js";
 
+const FIXED_KMAP_ROW_CODES = ["0", "1"];
+const FIXED_KMAP_COLUMN_CODES = ["00", "01", "11", "10"];
+const FIXED_KMAP_VARIABLES = new Set(["Q0", "Q1", "X"]);
+
 function pushUnique(target, value) {
   if (!target.includes(value)) target.push(value);
 }
 
 function buildDontCares(variableCount, specified, minterms) {
   return allBinaryCodes(variableCount).filter((code) => !specified.has(code) && !minterms.includes(code));
+}
+
+function isDontCareValue(value) {
+  return value === "-" || value === "X";
+}
+
+function supportsFixedKMapAxes(variables = []) {
+  const variableSet = new Set(variables);
+  return variableSet.has("Q0")
+    && variableSet.has("Q1")
+    && variables.every((variable) => FIXED_KMAP_VARIABLES.has(variable));
+}
+
+function codeForFixedKMapCell(variables, inputCode, stateCode) {
+  return variables
+    .map((variable) => {
+      if (variable === "X") return inputCode;
+      if (variable === "Q0") return stateCode[0];
+      if (variable === "Q1") return stateCode[1];
+      return "0";
+    })
+    .join("");
+}
+
+function fixedAxisKMapForEquation(equation, values) {
+  if (!supportsFixedKMapAxes(equation.variables)) return null;
+  const valueMap = new Map(values.map((item) => [item.code, item.value]));
+  return {
+    header: "x / Q1Q0",
+    rowVariable: "X",
+    columnVariables: ["Q1", "Q0"],
+    rowCodes: FIXED_KMAP_ROW_CODES,
+    columnCodes: FIXED_KMAP_COLUMN_CODES,
+    cells: FIXED_KMAP_ROW_CODES.flatMap((inputCode) =>
+      FIXED_KMAP_COLUMN_CODES.map((stateCode) => {
+        const code = codeForFixedKMapCell(equation.variables, inputCode, stateCode);
+        return {
+          rowCode: inputCode,
+          columnCode: stateCode,
+          code,
+          value: valueMap.get(code) || "0"
+        };
+      })
+    )
+  };
 }
 
 export function generateCircuitAnalysis({ rows, modelType, flipFlopType, inputVariables, outputVariables, encodingInfo }) {
@@ -45,7 +94,7 @@ export function generateCircuitAnalysis({ rows, modelType, flipFlopType, inputVa
         const bucket = equationBuckets.get(equationName);
         bucket.specified.add(termCode);
         if (value === "1") pushUnique(bucket.minterms, termCode);
-        if (value === "X") pushUnique(bucket.dontCares, termCode);
+        if (isDontCareValue(value)) pushUnique(bucket.dontCares, termCode);
         excitation[equationName] = value;
       });
     });
@@ -125,10 +174,14 @@ export function generateCircuitAnalysis({ rows, modelType, flipFlopType, inputVa
     };
   });
 
-  const mapItems = [...equations, ...outputEquations].map((equation) => ({
-    ...equation,
-    values: valuesForMap(equation)
-  }));
+  const mapItems = [...equations, ...outputEquations].map((equation) => {
+    const values = valuesForMap(equation);
+    return {
+      ...equation,
+      values,
+      kmap: fixedAxisKMapForEquation(equation, values)
+    };
+  });
 
   return {
     allVariables,

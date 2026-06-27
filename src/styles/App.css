@@ -279,6 +279,50 @@ button:hover {
   max-height: 300px;
 }
 
+.excitation-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  gap: 16px;
+  align-items: start;
+}
+
+.excitation-table-wrap {
+  min-width: 0;
+}
+
+.excitation-rule-card {
+  border: 1px solid #d5e0ef;
+  border-radius: 10px;
+  background: #f8fbff;
+  padding: 14px;
+  color: #173f70;
+}
+
+.excitation-rule-card h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: #123e73;
+}
+
+.excitation-rule-table {
+  width: 100%;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.excitation-rule-table th,
+.excitation-rule-table td {
+  text-align: center;
+  padding: 7px 8px;
+}
+
+.excitation-rule-card p {
+  margin: 0;
+  color: #536b85;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1198,6 +1242,14 @@ pre {
 @media (max-width: 720px) {
   .design-workspace {
     padding: 10px;
+  }
+
+  .excitation-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .excitation-rule-card {
+    max-width: 360px;
   }
 
   .tab-content {

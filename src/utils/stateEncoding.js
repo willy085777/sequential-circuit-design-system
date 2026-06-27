@@ -26,8 +26,8 @@ export function getEncodingBitVariables(bitCount) {
 }
 
 export function bitForStateVariable(stateCode, stateVariable) {
-  const bitIndexFromLsb = Number(stateVariable.slice(1));
-  return stateCode[stateCode.length - 1 - bitIndexFromLsb] || "0";
+  const bitIndexFromLeft = Number(stateVariable.slice(1));
+  return stateCode[bitIndexFromLeft] || "0";
 }
 
 export function codeInVariableOrder(stateCode, stateVariables) {

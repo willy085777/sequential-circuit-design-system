@@ -49,7 +49,7 @@ function inputValuesFromCode(inputVariables, inputCode) {
 }
 
 function codeFromStateValues(result, values) {
-  return result.encodingInfo.encodingBitVariables.map((stateVariable) => values[stateVariable] || "0").join("");
+  return result.encodingInfo.stateVariables.map((stateVariable) => values[stateVariable] || "0").join("");
 }
 
 function stateForCode(result, code) {

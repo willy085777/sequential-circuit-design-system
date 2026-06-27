@@ -34,10 +34,16 @@ export default function KMap({ result }) {
   }
 
   if (variableCount >= 2 && variableCount <= 4) {
+    const fixedAxisMap = selected.kmap;
     const rowCount = Math.floor(variableCount / 2);
     const colCount = variableCount - rowCount;
-    const rowCodes = gray[rowCount];
-    const colCodes = gray[colCount];
+    const rowCodes = fixedAxisMap?.rowCodes || gray[rowCount];
+    const colCodes = fixedAxisMap?.columnCodes || gray[colCount];
+    const axisCellMap = new Map(
+      (fixedAxisMap?.cells || []).map((cell) => [`${cell.rowCode}:${cell.columnCode}`, cell])
+    );
+    const headerLabel = fixedAxisMap?.header
+      || `${formatLabels(selected.variables.slice(0, rowCount), "")}\\${formatLabels(selected.variables.slice(rowCount), "")}`;
     return (
       <section className="kmap-section">
         <h3>K-map / Truth-Table Simplification</h3>
@@ -50,7 +56,7 @@ export default function KMap({ result }) {
         <table className="kmap-table">
           <thead>
             <tr>
-              <th>{`${formatLabels(selected.variables.slice(0, rowCount), "")}\\${formatLabels(selected.variables.slice(rowCount), "")}`}</th>
+              <th>{headerLabel}</th>
               {colCodes.map((code) => <th key={code}>{code || "-"}</th>)}
             </tr>
           </thead>
@@ -59,11 +65,12 @@ export default function KMap({ result }) {
               <tr key={rowCode || "single"}>
                 <th>{rowCode || "-"}</th>
                 {colCodes.map((colCode) => {
-                  const code = `${rowCode}${colCode}`;
+                  const axisCell = axisCellMap.get(`${rowCode}:${colCode}`);
+                  const code = axisCell?.code || `${rowCode}${colCode}`;
                   const groupsForCell = cellGroups(code);
                   return (
                     <td key={code} className="kmap-cell">
-                      <span className="kmap-value">{valueMap.get(code) || "0"}</span>
+                      <span className="kmap-value">{axisCell?.value ?? valueMap.get(code) ?? "0"}</span>
                       {groupsForCell.map((group) => (
                         <span
                           key={`${code}-${group.index}`}
