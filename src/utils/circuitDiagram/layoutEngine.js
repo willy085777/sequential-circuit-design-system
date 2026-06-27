@@ -1271,20 +1271,35 @@ function spreadStage(layout, stage, minGap = null) {
 }
 
 function spreadAndStageByGroups(layout) {
-  const gates = layout.gates
-    .filter((gate) => gate.stage === 1 && gate.type === "AND")
-    .sort((left, right) => centerY(left) - centerY(right));
+  const groups = layout.equationLayouts
+    .map((equationLayout) => ({
+      equationLayout,
+      refs: equationLayout.termRefs.filter((ref) => ref.kind === "and")
+    }))
+    .filter((group) => group.refs.length)
+    .sort((left, right) => left.equationLayout.targetRow - right.equationLayout.targetRow);
+  if (!groups.length) return;
+
   let cursorBottom = -Infinity;
-  let previousTarget = null;
-  gates.forEach((gate) => {
-    const gap = previousTarget === gate.equationTarget
-      ? layout.config.andGateIntraGroupGap
-      : layout.config.andGateInterGroupGap;
-    if (gate.y <= cursorBottom + gap) {
-      updateComponentGeometry(layout, gate, gate.x, cursorBottom + gap);
-    }
-    cursorBottom = gate.y + gate.height;
-    previousTarget = gate.equationTarget;
+  groups.forEach(({ equationLayout, refs }) => {
+    const gates = refs
+      .map((ref) => layout.componentById.get(ref.componentId))
+      .filter(Boolean);
+    if (!gates.length) return;
+    const gateHeight = gates[0].height;
+    const groupHeight = gates.length * gateHeight + Math.max(0, gates.length - 1) * layout.config.andGateIntraGroupGap;
+    const preferredTop = Math.round(equationLayout.targetRow - groupHeight / 2);
+    const top = Math.max(preferredTop, cursorBottom + layout.config.andGateInterGroupGap);
+    gates.forEach((gate, index) => {
+      const y = top + index * (gateHeight + layout.config.andGateIntraGroupGap);
+      updateComponentGeometry(layout, gate, gate.x, y);
+      const ref = refs.find((item) => item.componentId === gate.id);
+      if (ref) {
+        ref.sourceY = centerY(gate);
+        ref.sourceX = gate.pins.out.x;
+      }
+    });
+    cursorBottom = top + groupHeight;
   });
 }
 
@@ -1325,12 +1340,48 @@ function alignOutputTargetToY(layout, target, y) {
   layout.targetPins.set(target, { ...component.pins.in, componentId: component.id, pinName: "in" });
 }
 
-function preferredFinalTargetLaneX(layout, sourceRef, targetComponent) {
+function localClockLaneXForFlipFlopInputs(layout, targetComponent = null) {
+  const firstFlipFlop = (layout.flipFlops || [])[0];
+  if (firstFlipFlop) return firstFlipFlop.x - 34;
+  return targetComponent?.pins?.CLK?.x ?? (targetComponent?.x ? targetComponent.x - 34 : layout.config.ffStageX - 34);
+}
+
+function orToFlipFlopLaneSpacing(layout) {
+  return Math.max(24, layout.config.branchLaneSpacing);
+}
+
+function preferredFinalTargetLaneX(layout, sourceRef, targetComponent, equationTarget = null) {
   if (targetComponent?.kind === "output") {
     return Math.round((layout.config.orStageX + layout.config.outputStageX) / 2);
   }
   if (sourceRef?.kind === "or") {
     const sourceComponent = layout.componentById.get(sourceRef.componentId);
+    if (targetComponent?.kind === "flipFlop") {
+      const orToFlipFlopTargets = layout.equationLayouts
+        .filter((entry) => {
+          const targetPin = layout.targetPins.get(entry.target);
+          const component = targetPin ? layout.componentById.get(targetPin.componentId) : null;
+          return entry.finalSourceRef?.kind === "or" && component?.id === targetComponent.id;
+        })
+        .map((entry) => {
+          const component = layout.componentById.get(entry.finalSourceRef.componentId);
+          return {
+            target: entry.target,
+            sourceY: component?.pins?.out?.y ?? entry.finalSourceRef.sourceY ?? 0
+          };
+        })
+        .sort((left, right) => left.sourceY - right.sourceY || targetSortRank(left.target, layout.meta.outputVariables) - targetSortRank(right.target, layout.meta.outputVariables));
+      if (orToFlipFlopTargets.length > 1) {
+        const orderIndex = Math.max(0, orToFlipFlopTargets.findIndex((entry) => entry.target === equationTarget));
+        const clockMiddleX = localClockLaneXForFlipFlopInputs(layout, targetComponent);
+        const laneSpacing = orToFlipFlopLaneSpacing(layout);
+        const upperLaneX = clockMiddleX - laneSpacing;
+        const lowerLaneX = clockMiddleX + laneSpacing + Math.max(0, orderIndex - 1) * laneSpacing;
+        const preferredLaneX = orderIndex === 0 ? upperLaneX : lowerLaneX;
+        const leftLimit = (sourceComponent?.protectedBox?.right ?? sourceComponent?.pins?.out?.x ?? layout.config.orStageX) + layout.config.componentClearance;
+        return clamp(preferredLaneX, leftLimit, targetComponent.x - 10);
+      }
+    }
     if (sourceComponent?.protectedBox) {
       return sourceComponent.protectedBox.right + layout.config.componentClearance + 8;
     }
@@ -1709,7 +1760,7 @@ function createEquationWires(layout) {
         id: `wire-${sanitizeId(equationLayout.finalSourceRef.sourceSignal)}-to-target-${sanitizeId(equationLayout.target)}`,
         equationTarget: equationLayout.target,
         routingRole: targetComponent.kind === "output" ? "equation-to-output" : "equation-to-ff-input",
-        preferredX: preferredFinalTargetLaneX(layout, equationLayout.finalSourceRef, targetComponent)
+        preferredX: preferredFinalTargetLaneX(layout, equationLayout.finalSourceRef, targetComponent, equationLayout.target)
       });
       if (wire) {
         layout.targetConnections.push({
@@ -1734,7 +1785,7 @@ function createClockBranches(layout) {
     const nextFlipFlop = layout.flipFlops[index + 1];
     const needsCenteredUpperEntry = Boolean(index === 0 && nextFlipFlop);
     const isLastFlipFlop = index === layout.flipFlops.length - 1;
-    const branchX = needsCenteredUpperEntry ? ff.x - 34 : isLastFlipFlop ? targetPin.x : ff.x - 34 - index * 18;
+    const branchX = needsCenteredUpperEntry ? localClockLaneXForFlipFlopInputs(layout, nextFlipFlop) : isLastFlipFlop ? targetPin.x : ff.x - 34 - index * 18;
     const tap = allocateTap(layout, clkBus, branchX, wireId);
     const entryY = needsCenteredUpperEntry
       ? Math.min(targetPin.y + 34, nextFlipFlop.y - layout.config.componentClearance)

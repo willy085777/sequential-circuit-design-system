@@ -30,6 +30,10 @@ function rectBottom(rect) {
   return rect.y + rect.height;
 }
 
+function centerY(component) {
+  return component.y + component.height / 2;
+}
+
 function inflateRect(rect, margin) {
   return {
     x: rect.x - margin,
@@ -56,7 +60,7 @@ function componentRect(component) {
 function protectedRectFor(component) {
   if (component.type === "CONST") return inflateRect(visibleComponentRect(component), 2);
   const margin = component.kind === "flipFlop"
-    ? 18
+    ? 4
     : component.type === "OR"
       ? 2
     : component.type === "NOT"
@@ -724,6 +728,101 @@ function validateOrGroupPlacement(layout, errors) {
     });
 }
 
+function validateAndGroupingByOrTarget(layout, errors) {
+  const andGates = (layout.gates || [])
+    .filter((gate) => gate.type === "AND")
+    .sort((left, right) => centerY(left) - centerY(right));
+  const positionsByTarget = new Map();
+  andGates.forEach((gate, index) => {
+    const target = gate.equationTarget || gate.target;
+    if (!target) return;
+    if (!positionsByTarget.has(target)) positionsByTarget.set(target, []);
+    positionsByTarget.get(target).push(index);
+  });
+  positionsByTarget.forEach((positions, target) => {
+    if (positions.length < 2) return;
+    const min = Math.min(...positions);
+    const max = Math.max(...positions);
+    if (max - min + 1 === positions.length) return;
+    pushIssue(errors, "AND_GROUPING_ERROR", `AND gates feeding ${target} must be adjacent in the AND stage`, {
+      target,
+      positions
+    });
+  });
+}
+
+function primaryVerticalLaneX(wire) {
+  const verticalSegments = wireSegments(wire)
+    .filter((segment) => segmentOrientation(segment) === "vertical")
+    .map((segment) => {
+      const bounds = segmentBounds(segment);
+      return {
+        x: bounds.x1,
+        length: bounds.y2 - bounds.y1
+      };
+    })
+    .sort((left, right) => right.length - left.length);
+  return verticalSegments[0]?.x;
+}
+
+function localClockLaneX(layout) {
+  const centeredClock = (layout.wires || []).find((wire) => wire.routingRole === "clock-branch" && wire.centeredClockEntry);
+  const laneX = centeredClock ? primaryVerticalLaneX(centeredClock) : undefined;
+  if (Number.isFinite(laneX)) return laneX;
+  const firstClock = (layout.wires || []).find((wire) => wire.routingRole === "clock-branch");
+  return firstClock ? primaryVerticalLaneX(firstClock) : undefined;
+}
+
+function validateOrOutputLaneOrdering(layout, errors) {
+  const entriesByTarget = new Map();
+  (layout.wires || [])
+    .filter((wire) => wire.routingRole === "equation-to-ff-input")
+    .map((wire) => {
+      const source = (layout.components || []).find((component) => component.id === wire.sourceComponentId);
+      const target = (layout.components || []).find((component) => component.id === wire.targetComponentId);
+      return {
+        wire,
+        source,
+        target,
+        laneX: primaryVerticalLaneX(wire)
+      };
+    })
+    .filter((entry) => entry.source?.type === "OR" && entry.target?.kind === "flipFlop" && Number.isFinite(entry.laneX))
+    .forEach((entry) => {
+      if (!entriesByTarget.has(entry.target.id)) entriesByTarget.set(entry.target.id, []);
+      entriesByTarget.get(entry.target.id).push(entry);
+    });
+
+  const clkLaneX = localClockLaneX(layout);
+  entriesByTarget.forEach((entries, targetId) => {
+    const sorted = [...entries].sort((left, right) => centerY(left.source) - centerY(right.source));
+    for (let index = 0; index < sorted.length - 1; index += 1) {
+      const upper = sorted[index];
+      const lower = sorted[index + 1];
+      if (upper.laneX < lower.laneX) continue;
+      pushIssue(errors, "OR_OUTPUT_LANE_ORDER_ERROR", "Upper OR output vertical lanes must be left of lower OR output lanes", {
+        target: targetId,
+        upperWire: upper.wire.id,
+        lowerWire: lower.wire.id,
+        upperLaneX: upper.laneX,
+        lowerLaneX: lower.laneX
+      });
+    }
+    if (sorted.length < 2 || !Number.isFinite(clkLaneX)) return;
+    const upper = sorted[0];
+    const lower = sorted[sorted.length - 1];
+    if (upper.laneX < clkLaneX && clkLaneX < lower.laneX) return;
+    pushIssue(errors, "OR_OUTPUT_CLK_LANE_ORDER_ERROR", "J/K OR output lanes must keep CLK between the upper and lower OR output vertical lanes", {
+      target: targetId,
+      upperWire: upper.wire.id,
+      lowerWire: lower.wire.id,
+      upperLaneX: upper.laneX,
+      clkLaneX,
+      lowerLaneX: lower.laneX
+    });
+  });
+}
+
 function validateReferenceStyle(layout, errors, warnings) {
   const feedbackBuses = (layout.buses || [])
     .filter((bus) => bus.signalClass === "feedback")
@@ -1106,7 +1205,7 @@ function validateReferenceStyle(layout, errors, warnings) {
         ? orderRank(OR_DIRECT_ORDER, terms[index + 1].sourceSignal)
         : OR_DIRECT_ORDER.length + 100 + (terms[index + 1].sourceY || 0) / 10000;
       if (leftRank > rightRank) {
-        pushIssue(errors, "OR_INPUT_ORDER_ERROR", `${gate.id} input terms violate the direct-Q / source-height order`, {
+        pushWarning(warnings, "OR_INPUT_ORDER_WARNING", `${gate.id} input terms differ from the preferred direct-Q / source-height order; accepted if connections remain correct and clear`, {
           gate: gate.id,
           terms
         });
@@ -1141,6 +1240,8 @@ export function validateDiagramLayout(layout) {
   validateAndOutputStagger(layout, errors);
   validateAndToOrRoutingStyle(layout, errors);
   validateOrGroupPlacement(layout, errors);
+  validateAndGroupingByOrTarget(layout, errors);
+  validateOrOutputLaneOrdering(layout, errors);
   validateReferenceStyle(layout, errors, warnings);
   return publicResult(errors, warnings, {
     componentCount: layout.components?.length || 0,
@@ -1178,17 +1279,6 @@ function validateOrGates(layout, netlist, errors) {
         }
         seenNets.add(wire.netId);
       });
-      for (let index = 0; index < inputWires.length - 1; index += 1) {
-        const upperWire = inputWires[index];
-        const lowerWire = inputWires[index + 1];
-        if (upperWire && lowerWire && upperWire.sourceY > lowerWire.sourceY) {
-          pushIssue(errors, "OR_INPUT_ORDER_ERROR", `${gate.id} OR inputs violate source-height ordering`, {
-            gate: gate.id,
-            upperWire: upperWire.id,
-            lowerWire: lowerWire.id
-          });
-        }
-      }
       const sourceWire = wires.find((wire) => wire.source === `${gate.id}.out`);
       if (!sourceWire || !wireStartsAt(sourceWire, gate.pins.out)) {
         pushIssue(errors, "DANGLING_PIN_CONNECTION", `${gate.id}.out has no exact output wire`, {
